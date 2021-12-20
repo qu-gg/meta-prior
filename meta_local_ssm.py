@@ -1,9 +1,8 @@
 """
-@file metaNN_dgssm.py
+@file meta_local_ssm.py
 @author Ryan Missel
 
-Handles the global version of the MetaPrior for the Bayesian NODE vector field
-Inference of the 
+Handles the local code version of the MetaPrior for the Bayesian NODE vector field
 """
 import os
 import math
@@ -23,7 +22,7 @@ from utils import Flatten, UnFlatten, get_loader, plot_metric, plot_recon, get_a
 class Network(nn.Module):
     def __init__(self, q, param_amort, z_amort,
                  n_filt, n_hidden_units=100, n_layers=2, dropout=0.0,
-                 code_dim=10, layer_norm=True):
+                 code_dim=10, layer_norm=True, activation='tanh'):
         """
         Module that represents the DG-SSM. Has a parameter encoder, q(W|X), and a latent encoder, q(z0|X)
 
@@ -52,7 +51,22 @@ class Network(nn.Module):
         self.layer_norms, self.acts = [], []
         for i, (n_in, n_out) in enumerate(zip(self.layers_dim[:-1], self.layers_dim[1:])):
             self.layer_norms.append(nn.LayerNorm(n_out) if layer_norm and i < n_layers else nn.Identity())
-            self.acts.append(get_act('leaky_relu') if i < n_layers else get_act('linear'))  # no act. in final layer
+            self.acts.append(get_act(activation) if i < n_layers else get_act('linear'))  # no act. in final layer
+
+        """ Local code embedder """
+        self.local_encoder = nn.Sequential(
+            nn.Conv2d(z_amort, n_filt, kernel_size=5, stride=2, padding=(2, 2)),  # 14,14
+            nn.BatchNorm2d(n_filt),
+            nn.ReLU(),
+            nn.Conv2d(n_filt, n_filt * 2, kernel_size=5, stride=2, padding=(2, 2)),  # 7,7
+            nn.BatchNorm2d(n_filt * 2),
+            nn.ReLU(),
+            nn.Conv2d(n_filt * 2, n_filt * 4, kernel_size=5, stride=2, padding=(2, 2)),
+            nn.Tanh(),
+            Flatten()
+        )
+
+        self.local_out = nn.Linear(h_dim, self.code_dim)
 
         """ MetaPrior """
         self.code_mu = nn.ParameterList([])
@@ -66,7 +80,7 @@ class Network(nn.Module):
 
         for lidx in range(len(self.layers_dim)):
             code = torch.nn.Parameter(
-                0.1 * torch.ones([self.layers_dim[lidx], self.code_dim]),
+                torch.ones([self.layers_dim[lidx], self.code_dim]),
                 requires_grad=True
             )
             self.code_var.append(code)
@@ -74,10 +88,10 @@ class Network(nn.Module):
         self.codes = [1, 2, 3, 4]
 
         self.hyperprior = nn.Sequential(
-            nn.Linear(self.code_dim * 2, 36),
-            nn.LeakyReLU(0.1),
+            nn.Linear(self.code_dim * 3, 36),
+            nn.ReLU(),
             nn.Linear(36, 36),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),
             nn.Linear(36, 1),
         )
 
@@ -87,10 +101,10 @@ class Network(nn.Module):
         self.z_encoder = nn.Sequential(
             nn.Conv2d(z_amort, n_filt, kernel_size=5, stride=2, padding=(2, 2)),  # 14,14
             nn.BatchNorm2d(n_filt),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.Conv2d(n_filt, n_filt * 2, kernel_size=5, stride=2, padding=(2, 2)),  # 7,7
             nn.BatchNorm2d(n_filt * 2),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.Conv2d(n_filt * 2, n_filt * 4, kernel_size=5, stride=2, padding=(2, 2)),
             nn.Tanh(),
             Flatten()
@@ -98,14 +112,14 @@ class Network(nn.Module):
 
         # Translates encoder embedding into mean and logvar, q(z0|X)
         self.mean_z_net = nn.Sequential(
-            nn.Linear(h_dim, h_dim * 2),
-            nn.LeakyReLU(),
-            nn.Linear(h_dim * 2, self.Q),
+            nn.Linear(h_dim, int(h_dim * 1.5)),
+            nn.ReLU(),
+            nn.Linear(int(h_dim * 1.5), self.Q),
         )
 
         self.logvar_z_net = nn.Sequential(
             nn.Linear(h_dim, h_dim * 2),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.Linear(h_dim * 2, self.Q),
         )
 
@@ -121,13 +135,13 @@ class Network(nn.Module):
             UnFlatten(4),
             nn.ConvTranspose2d(h_dim // 16, n_filt * 8, kernel_size=4, stride=1, padding=(0, 0)),
             nn.BatchNorm2d(n_filt * 8),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.ConvTranspose2d(n_filt * 8, n_filt * 4, kernel_size=5, stride=2, padding=(1, 1)),
             nn.BatchNorm2d(n_filt * 4),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.ConvTranspose2d(n_filt * 4, n_filt * 2, kernel_size=5, stride=2, padding=(1, 1), output_padding=(1, 1)),
             nn.BatchNorm2d(n_filt * 2),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.ConvTranspose2d(n_filt * 2, 1, kernel_size=5, stride=1, padding=(2, 2)),
             nn.Sigmoid(),
         )
@@ -164,7 +178,7 @@ class Network(nn.Module):
         kl = self.priorlog - var + (torch.exp(var) ** 2 + (mus - 0) ** 2) / (2 * math.exp(self.priorlog) ** 2) - 0.5
         return kl.sum()
 
-    def draw_f(self):
+    def draw_f(self, local_code):
         """
         Generates the ODE function based on the sampled weights/biases of the sample
         :param idx: idx of the sample in the batch
@@ -181,10 +195,12 @@ class Network(nn.Module):
                 # Generate weight codes
                 temp = codes[idx].unsqueeze(1).repeat(1, self.layers_dim[idx + 1], 1).view([-1, self.code_dim])
                 temp2 = codes[idx + 1].unsqueeze(0).repeat(self.layers_dim[idx], 1, 1).view([-1, self.code_dim])
-                weight_code = torch.cat((temp2, temp), dim=1)
+                lcw = local_code.unsqueeze(0).repeat(temp.shape[0], 1)
+                weight_code = torch.cat((temp2, temp, lcw), dim=1)
 
                 # Generate bias codes (concatenation is just with a zeros vector)
-                bias_code = torch.cat((torch.zeros_like(codes[idx + 1]), codes[idx + 1]), dim=1)
+                lcb = local_code.unsqueeze(0).repeat(codes[idx + 1].shape[0], 1)
+                bias_code = torch.cat((torch.zeros_like(codes[idx + 1]), codes[idx + 1], lcb), dim=1)
 
                 # Get weights and biases out
                 w = self.hyperprior(weight_code).view([self.layers_dim[idx], self.layers_dim[idx + 1]])
@@ -226,15 +242,26 @@ class Network(nn.Module):
         # Evaluate model forward over T to get L latent reconstructions
         t = dt * torch.arange(generation_len, dtype=torch.float).to(z0.device)
 
-        # Draw function for index
-        f = self.draw_f()
+        # Generate local code
+        local_codes = self.local_encoder(x[:, :self.Z_AMORT].squeeze(2))
+        local_codes = self.local_out(local_codes)
+        print(z0.shape, local_codes.shape)
 
-        # Set odefunc to use
-        odef = lambda ts, zs: self.odefunc(ts, zs, f)  # make the ODE forward function
+        # Evaluate ODE
+        zt = []
+        for idx, (z_init, local_code) in enumerate(zip(z0, local_codes)):
+            # Draw function for index
+            f = self.draw_f(local_code)
 
-        # Evaluate forward over timestep
-        zt = odeint(odef, z0, t, method='rk4', options={'step_size': 0.1})  # [T,q]
-        zt = zt.permute([1, 0, 2])
+            # Set odefunc to use
+            odef = lambda ts, zs: self.odefunc(ts, zs, f)  # make the ODE forward function
+
+            # Evaluate forward over timestep
+            z = odeint(odef, z_init, t, method='rk4', options={'step_size': 0.1})  # [T,q]
+            zt.append(z)  # [1,T,q]
+
+        # Stack z trajectories and decode them
+        zt = torch.stack(zt)
 
         # Decode
         s = self.fc3(zt.contiguous().view([batch_size * generation_len, z0.shape[1]]))  # L*N*T,h_dim
@@ -395,6 +422,7 @@ if __name__ == '__main__':
     GENERATION_LEN = args.generation_len
     DIM = args.dim
     CODE_DIM = args.code_dim
+    ACT = args.act
 
     DROPOUT = args.dropout
     NUM_LAYERS = args.num_layers
@@ -425,7 +453,7 @@ if __name__ == '__main__':
     # Initialize network and optimizer
     net = Network(Q, PARAM_AMORT, Z_AMORT, NFILT, n_layers=NUM_LAYERS,
                 n_hidden_units=NUM_HIDDEN, dropout=DROPOUT, layer_norm=LAYER_NORM,
-                  code_dim=CODE_DIM).to(device)
+                  code_dim=CODE_DIM, activation=ACT).to(device)
 
     # Count parameters and save initial meta-space
     count_parameters(net)

@@ -24,7 +24,7 @@ class PymunkData(Dataset):
         if config['out_distr'] == 'bernoulli':
             self.images = (self.images > 0).astype('float32')
 
-        self.images = torch.from_numpy(self.images).to(device=torch.Tensor().device)[:1000]
+        self.images = torch.from_numpy(self.images).to(device=torch.Tensor().device)[:, :30]
         self.images = self.images.unsqueeze(2)
 
         # Load classes
@@ -59,7 +59,7 @@ class PymunkData(Dataset):
 
 
 if __name__ == '__main__':
-    config = {'dataset': 'mixed_test', 'out_distr': 'bernoulli', 'dim_u': 1}
+    config = {'dataset': 'box_gravity_train', 'out_distr': 'bernoulli', 'dim_u': 1}
 
     dataset = PymunkData("box_data/{}.npz".format(config['dataset']), config)
     print(dataset.images.shape)

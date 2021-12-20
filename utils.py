@@ -32,12 +32,12 @@ class UnFlatten(nn.Module):
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--exp_name', type=str, default='test', help='name of exp to save')
-    parser.add_argument('--exp_id', type=str, default='08', help='index of exp to save')
+    parser.add_argument('--exp_name', type=str, default='grav', help='name of exp to save')
+    parser.add_argument('--exp_id', type=str, default='02', help='index of exp to save')
     parser.add_argument('--exp_type', type=str, default='grav', help='which dataset to use')
 
     parser.add_argument('--num_epochs', type=int, default=1000, help='number of epochs to run over')
-    parser.add_argument('--batch_size', type=int, default=25, help='size of batch')
+    parser.add_argument('--batch_size', type=int, default=50, help='size of batch')
     parser.add_argument('--train_len', type=int, default=10, help='how many X samples to use in model initialization')
     parser.add_argument('--generation_len', type=int, default=25, help='total length to generate')
     parser.add_argument('--dim', type=int, default=32, help='dimension of the image data')
@@ -46,9 +46,10 @@ def parse_args():
     parser.add_argument('--bnn', type=bool, default=False, help='whether the ode is a BNN')
     parser.add_argument('--digits', type=list, default=[0, 1, 2, 3, 4, 6], help='which digits to consider in rotMNIST')
 
-    parser.add_argument('--dropout', type=float, default=0.0, help='percent of dropout in the ODE func layers')
+    parser.add_argument('--dropout', type=float, default=0.2, help='percent of dropout in the ODE func layers')
     parser.add_argument('--num_layers', type=int, default=2, help='number of layers in the ODE func')
     parser.add_argument('--num_hidden', type=int, default=100, help='number of nodes per hidden layer in ODE func')
+    parser.add_argument('--act', type=str, default='tanh', help='type of activation function to be used in the ODE func')
 
     parser.add_argument('--param_amort', type=int, default=10, help='how many X samples to use in parameter inference')
     parser.add_argument('--z_amort', type=int, default=10, help='how many X samples to use in z0 inference')
@@ -64,7 +65,7 @@ def parse_args():
     parser.add_argument('--learning_rate', type=float, default=1e-3, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0, help='weight decay of the optimizer')
     parser.add_argument('--amsgrad', type=bool, default=False, help='whether to use the AMSGrad variant')
-    parser.add_argument('--early_stop', type=int, default=200, help='number of steps for early stop')
+    parser.add_argument('--early_stop', type=int, default=1000, help='number of steps for early stop')
     parser.add_argument('--layer_norm', type=bool, default=True, help='normalize ODEfunc layers')
 
     parser.add_argument('--model_type', type=str, default='convODECase', help='which model to evaluate (only effective in evaluation)')
@@ -306,6 +307,7 @@ def count_parameters(model):
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad: continue
         param = parameter.numel()
+
         table.add_row([name, param])
         total_params += param
     print(table)

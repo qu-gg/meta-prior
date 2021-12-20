@@ -43,7 +43,8 @@ class Network(nn.Module):
         self.Z_AMORT = z_amort
 
         # Array that holds dimensions over hidden layers
-        self.layers_dim = [q] + n_layers * [n_hidden_units] + [q]
+        self.layers_dim = [q + code_dim] + n_layers * [n_hidden_units] + [q]
+        print("Layer dimensions: ", self.layers_dim)
         self.code_dim = code_dim
         self.priorlog = math.log(0.1)
 
@@ -52,7 +53,22 @@ class Network(nn.Module):
         self.layer_norms, self.acts = [], []
         for i, (n_in, n_out) in enumerate(zip(self.layers_dim[:-1], self.layers_dim[1:])):
             self.layer_norms.append(nn.LayerNorm(n_out) if layer_norm and i < n_layers else nn.Identity())
-            self.acts.append(get_act('leaky_relu') if i < n_layers else get_act('linear'))  # no act. in final layer
+            self.acts.append(get_act('tanh') if i < n_layers else get_act('linear'))  # no act. in final layer
+
+        """ Local code embedder """
+        self.local_encoder = nn.Sequential(
+            nn.Conv2d(z_amort, n_filt, kernel_size=5, stride=2, padding=(2, 2)),  # 14,14
+            nn.BatchNorm2d(n_filt),
+            nn.ReLU(),
+            nn.Conv2d(n_filt, n_filt * 2, kernel_size=5, stride=2, padding=(2, 2)),  # 7,7
+            nn.BatchNorm2d(n_filt * 2),
+            nn.ReLU(),
+            nn.Conv2d(n_filt * 2, n_filt * 4, kernel_size=5, stride=2, padding=(2, 2)),
+            nn.Tanh(),
+            Flatten()
+        )
+
+        self.local_out = nn.Linear(h_dim, self.code_dim)
 
         """ MetaPrior """
         self.code_mu = nn.ParameterList([])
@@ -66,7 +82,7 @@ class Network(nn.Module):
 
         for lidx in range(len(self.layers_dim)):
             code = torch.nn.Parameter(
-                0.1 * torch.ones([self.layers_dim[lidx], self.code_dim]),
+                torch.ones([self.layers_dim[lidx], self.code_dim]),
                 requires_grad=True
             )
             self.code_var.append(code)
@@ -75,9 +91,9 @@ class Network(nn.Module):
 
         self.hyperprior = nn.Sequential(
             nn.Linear(self.code_dim * 2, 36),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),
             nn.Linear(36, 36),
-            nn.LeakyReLU(0.1),
+            nn.ReLU(),
             nn.Linear(36, 1),
         )
 
@@ -87,10 +103,10 @@ class Network(nn.Module):
         self.z_encoder = nn.Sequential(
             nn.Conv2d(z_amort, n_filt, kernel_size=5, stride=2, padding=(2, 2)),  # 14,14
             nn.BatchNorm2d(n_filt),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.Conv2d(n_filt, n_filt * 2, kernel_size=5, stride=2, padding=(2, 2)),  # 7,7
             nn.BatchNorm2d(n_filt * 2),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.Conv2d(n_filt * 2, n_filt * 4, kernel_size=5, stride=2, padding=(2, 2)),
             nn.Tanh(),
             Flatten()
@@ -98,15 +114,15 @@ class Network(nn.Module):
 
         # Translates encoder embedding into mean and logvar, q(z0|X)
         self.mean_z_net = nn.Sequential(
-            nn.Linear(h_dim, h_dim * 2),
-            nn.LeakyReLU(),
-            nn.Linear(h_dim * 2, self.Q),
+            nn.Linear(h_dim, h_dim // 2),
+            nn.ReLU(),
+            nn.Linear(h_dim // 2, self.Q),
         )
 
         self.logvar_z_net = nn.Sequential(
-            nn.Linear(h_dim, h_dim * 2),
-            nn.LeakyReLU(),
-            nn.Linear(h_dim * 2, self.Q),
+            nn.Linear(h_dim, h_dim // 2),
+            nn.ReLU(),
+            nn.Linear(h_dim // 2, self.Q),
         )
 
         # Holds generated z0 means and logvars for use in KL calculations
@@ -121,13 +137,13 @@ class Network(nn.Module):
             UnFlatten(4),
             nn.ConvTranspose2d(h_dim // 16, n_filt * 8, kernel_size=4, stride=1, padding=(0, 0)),
             nn.BatchNorm2d(n_filt * 8),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.ConvTranspose2d(n_filt * 8, n_filt * 4, kernel_size=5, stride=2, padding=(1, 1)),
             nn.BatchNorm2d(n_filt * 4),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.ConvTranspose2d(n_filt * 4, n_filt * 2, kernel_size=5, stride=2, padding=(1, 1), output_padding=(1, 1)),
             nn.BatchNorm2d(n_filt * 2),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.ConvTranspose2d(n_filt * 2, 1, kernel_size=5, stride=1, padding=(2, 2)),
             nn.Sigmoid(),
         )
@@ -162,9 +178,9 @@ class Network(nn.Module):
         var = torch.cat([cvar.view([-1]) for cvar in self.code_var])
 
         kl = self.priorlog - var + (torch.exp(var) ** 2 + (mus - 0) ** 2) / (2 * math.exp(self.priorlog) ** 2) - 0.5
-        return kl.sum()
+        return kl.mean()
 
-    def draw_f(self):
+    def draw_f(self, lc):
         """
         Generates the ODE function based on the sampled weights/biases of the sample
         :param idx: idx of the sample in the batch
@@ -177,6 +193,8 @@ class Network(nn.Module):
         ]
 
         def func(x):
+            x = torch.cat((x, lc), dim=1)
+
             for idx in range(len(self.layers_dim) - 1):
                 # Generate weight codes
                 temp = codes[idx].unsqueeze(1).repeat(1, self.layers_dim[idx + 1], 1).view([-1, self.code_dim])
@@ -226,8 +244,12 @@ class Network(nn.Module):
         # Evaluate model forward over T to get L latent reconstructions
         t = dt * torch.arange(generation_len, dtype=torch.float).to(z0.device)
 
+        # Generate local code
+        local_codes = self.local_encoder(x[:, :self.Z_AMORT].squeeze(2))
+        local_codes = self.local_out(local_codes)
+
         # Draw function for index
-        f = self.draw_f()
+        f = self.draw_f(local_codes)
 
         # Set odefunc to use
         odef = lambda ts, zs: self.odefunc(ts, zs, f)  # make the ODE forward function
